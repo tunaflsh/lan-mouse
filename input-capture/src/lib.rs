@@ -171,6 +171,21 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// Start capturing at `pos` as if the pointer had moved onto the
+    /// screen edge at that position. Used by frontends to enter a
+    /// client from a key binding or IPC request instead of moving the
+    /// mouse across the barrier.
+    ///
+    /// The event stream produces the same [`CaptureEvent::Begin`] a
+    /// physical edge crossing would, so downstream handling (enter
+    /// hooks, release bind, protocol `Enter`) is unchanged.
+    pub async fn activate(&mut self, pos: Position) -> Result<(), CaptureError> {
+        if !self.position_map.contains_key(&pos) {
+            return Err(CaptureError::NoCaptureAtPosition(pos));
+        }
+        self.capture.activate(pos)
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -286,6 +301,15 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// start capturing at `pos` without a pointer crossing.
+    ///
+    /// Backends that can only observe the pointer (libei, for example,
+    /// delivers no input while no capture is active) leave the default
+    /// implementation in place and report [`CaptureError::ActivateUnsupported`].
+    fn activate(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        Err(CaptureError::ActivateUnsupported)
+    }
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

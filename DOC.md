@@ -23,6 +23,19 @@ graph TD
 The input component is responsible for translating inputs from a given backend
 to a standardized format and passing them to the event emitter.
 
+A capture normally starts when the pointer crosses a barrier. `InputCapture::activate(pos)`
+starts one explicitly instead, producing the same `CaptureEvent::Begin` an edge
+crossing produces, so enter hooks, the release bind and the protocol `Enter` event
+behave identically. Frontends trigger it via `FrontendRequest::Enter(position)`
+(`lan-mouse cli enter <pos>`). An `activate` request is ignored while a capture is
+already active.
+
+Which backend can implement this depends on whether input is delivered without an
+edge crossing: the `layer-shell` backend warps the pointer onto its barrier with
+`wlr-virtual-pointer`, while the `libei` backend receives no input until the
+compositor hands it a session, so it leaves the default implementation and
+reports `CaptureError::ActivateUnsupported`.
+
 ### Emitter
 The event emitter serializes events and sends them over the network
 to the correct client.

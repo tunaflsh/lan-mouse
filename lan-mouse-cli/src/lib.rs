@@ -66,6 +66,16 @@ enum CliSubcommand {
     EnableCapture,
     /// re-enable emulation
     EnableEmulation,
+    /// enter the client at the given screen edge without moving the pointer there
+    Enter { pos: Position },
+    /// shorthand for `enter left`
+    Left,
+    /// shorthand for `enter right`
+    Right,
+    /// shorthand for `enter top`
+    Top,
+    /// shorthand for `enter bottom`
+    Bottom,
     /// authorize a public key
     AuthorizeKey {
         description: String,
@@ -157,6 +167,11 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
         CliSubcommand::EnableEmulation => tx.request(FrontendRequest::EnableEmulation).await?,
+        CliSubcommand::Enter { pos } => tx.request(FrontendRequest::Enter(pos)).await?,
+        CliSubcommand::Left => tx.request(FrontendRequest::Enter(Position::Left)).await?,
+        CliSubcommand::Right => tx.request(FrontendRequest::Enter(Position::Right)).await?,
+        CliSubcommand::Top => tx.request(FrontendRequest::Enter(Position::Top)).await?,
+        CliSubcommand::Bottom => tx.request(FrontendRequest::Enter(Position::Bottom)).await?,
         CliSubcommand::AuthorizeKey {
             description,
             sha256_fingerprint,

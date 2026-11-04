@@ -188,6 +188,7 @@ impl Service {
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
             FrontendRequest::EnableEmulation => self.emulation.reenable(),
+            FrontendRequest::Enter(pos) => self.enter(pos),
             FrontendRequest::Enumerate() => self.enumerate(),
             FrontendRequest::UpdateFixIps(handle, fix_ips) => {
                 self.update_fix_ips(handle, fix_ips);
@@ -501,6 +502,23 @@ impl Service {
             self.broadcast_client(handle);
             log::info!("deactivated client {handle}");
         }
+    }
+
+    /// Enter the client responsible for `pos` without the pointer having
+    /// to cross the barrier. This is the Wayland-friendly counterpart of
+    /// moving the mouse onto the screen edge: the capture backend warps
+    /// the pointer onto its barrier (or otherwise starts a capture) and
+    /// the regular enter handling takes over from there.
+    fn enter(&mut self, pos: Position) {
+        // Barriers only exist for active clients: entering a position
+        // without one could not work by crossing the edge either.
+        if self.client_manager.client_at(pos).is_none() {
+            let msg = format!("cannot enter {pos}: no active client at this position");
+            log::warn!("{msg}");
+            self.notify_frontend(FrontendEvent::Error(msg));
+            return;
+        }
+        self.capture.activate(pos);
     }
 
     fn activate_client(&mut self, handle: ClientHandle) {

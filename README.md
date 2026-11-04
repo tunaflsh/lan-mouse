@@ -147,9 +147,12 @@ gtk-update-icon-cache /usr/local/share/icons/hicolor/
 sudo mkdir -p /usr/local/share/applications
 sudo cp de.feschber.LanMouse.desktop /usr/local/share/applications
 
-# when using firewalld: install firewall rule
-sudo cp firewall/lan-mouse.xml /etc/firewalld/services
-# -> enable the service in firewalld settings
+# when using firewalld: install the service and allow it
+sudo cp firewall/lan-mouse.xml /etc/firewalld/services/
+sudo firewall-cmd --reload
+sudo firewall-cmd --add-service=lan-mouse --permanent
+sudo firewall-cmd --reload
+# see firewall/README.md for the zone caveats
 ```
 
 Instead of downloading from the releases, the `lan-mouse` binary
@@ -344,6 +347,39 @@ lan-mouse cli <cmd> help
 ```
 for information on how to use a specific command.
 
+#### Entering a device from a key binding
+
+Normally a client is entered by moving the pointer onto the corresponding screen
+edge. `enter` starts the same capture explicitly, without having to move the
+pointer there yourself:
+
+```sh
+lan-mouse cli enter right
+# shorthand:
+lan-mouse cli right
+```
+
+`left`, `right`, `top` and `bottom` select the position of the client, exactly
+like the `position` option in the configuration file. The release bind still
+returns control to the local machine.
+
+This is useful for keyboard-driven setups and for compositors where reaching the
+screen edge is impractical. For example in niri:
+
+```kdl
+Mod+Ctrl+Right { spawn "lan-mouse" "cli" "right"; }
+Mod+Ctrl+Left { spawn "lan-mouse" "cli" "left"; }
+```
+
+> [!NOTE]
+> The `enter` command currently requires the `layer-shell` capture backend and a
+> compositor implementing [wlr-virtual-pointer-unstable-v1](https://wayland.app/protocols/wlr-virtual-pointer-unstable-v1)
+> (niri, sway, Hyprland, …). The pointer is moved onto lan-mouse's barrier
+> strip, which then starts the capture as if the edge had been crossed.
+> On the `libei` backend (GNOME, KDE) and on X11, Windows and macOS, activation
+> is not supported yet: the request is logged as a warning and only edge
+> crossings work there.
+
 </details>
 
 <details>
@@ -483,6 +519,7 @@ The following sections detail the emulation and capture backends provided by lan
 | X11                       |                          |                          |                          |                                        | WIP |
 
 - `layer-shell`: This backend creates a single pixel wide window on the edges of Displays to capture the cursor using the [layer-shell protocol](https://wayland.app/protocols/wlr-layer-shell-unstable-v1).
+  Captures can also be started from a key binding with [`lan-mouse cli enter <position>`](#entering-a-device-from-a-key-binding); this additionally requires the [wlr-virtual-pointer protocol](https://wayland.app/protocols/wlr-virtual-pointer-unstable-v1) to move the pointer onto the barrier.
 - `libei`: This backend uses [libei](https://gitlab.freedesktop.org/libinput/libei) and is supported by GNOME >= 45 or KDE Plasma >= 6.1.
 - `windows`: Backend for input capture on Windows.
 - `macos`: Backend for input capture on MacOS.

@@ -44,6 +44,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, KeyboardInteractivity, ZwlrLayerSurfaceV1},
 };
 
+use wayland_protocols_wlr::virtual_pointer::v1::client::{
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+};
+
 use wayland_client::{
     Connection, Dispatch, DispatchError, EventQueue, QueueHandle, WEnum,
     backend::{ReadEventsGuard, WaylandError},
@@ -62,6 +67,7 @@ use wayland_client::{
 };
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{CaptureError, CaptureEvent};
 
@@ -79,6 +85,9 @@ struct Globals {
     shm: wl_shm::WlShm,
     layer_shell: ZwlrLayerShellV1,
     xdg_output_manager: ZxdgOutputManagerV1,
+    /// used to move the pointer onto a barrier for [`State::activate`];
+    /// optional, since edge crossings do not need it
+    virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +128,7 @@ struct State {
     pointer_lock: Option<ZwpLockedPointerV1>,
     rel_pointer: Option<ZwpRelativePointerV1>,
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    virtual_pointer: Option<ZwlrVirtualPointerV1>,
     active_windows: Vec<Arc<Window>>,
     focused: Option<Arc<Window>>,
     global_list: GlobalList,
@@ -148,16 +158,15 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    /// logical layout rectangle of the output this window is anchored to
+    output_rect: Rect,
 }
 
 impl Window {
-    fn new(
-        state: &State,
-        qh: &QueueHandle<State>,
-        output: &WlOutput,
-        pos: Position,
-        size: (i32, i32),
-    ) -> Window {
+    fn new(state: &State, qh: &QueueHandle<State>, output: &Output, pos: Position) -> Window {
+        let info = output.info.as_ref().expect("output info");
+        let size = info.size;
+        let output = &output.wl_output;
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
@@ -207,6 +216,7 @@ impl Window {
             buffer,
             surface,
             layer_surface,
+            output_rect: (info.position.0, info.position.1, size.0, size.1),
         }
     }
 }
@@ -268,6 +278,80 @@ fn draw(f: &mut File, (width, height): (u32, u32)) {
     }
 }
 
+/// A rectangle in the compositor's logical layout space:
+/// `(x, y, width, height)`.
+type Rect = (i32, i32, i32, i32);
+
+/// Bounding box of all outputs, in the coordinate space used by the
+/// `wlr-virtual-pointer` absolute motion request.
+fn layout_box(outputs: &[Output]) -> Option<Rect> {
+    union_rects(
+        outputs
+            .iter()
+            .filter_map(|o| o.info.as_ref())
+            .map(|i| (i.position.0, i.position.1, i.size.0, i.size.1))
+            .filter(|(_, _, w, h)| *w > 0 && *h > 0),
+    )
+}
+
+fn union_rects(rects: impl Iterator<Item = Rect>) -> Option<Rect> {
+    rects.reduce(|a, b| {
+        let x0 = a.0.min(b.0);
+        let y0 = a.1.min(b.1);
+        let x1 = (a.0 + a.2).max(b.0 + b.2);
+        let y1 = (a.1 + a.3).max(b.1 + b.3);
+        (x0, y0, x1 - x0, y1 - y0)
+    })
+}
+
+/// Point inside the 1px barrier strip on the given side of an output.
+fn barrier_point(pos: Position, (x, y, w, h): Rect) -> (f64, f64) {
+    let (x, y, w, h) = (f64::from(x), f64::from(y), f64::from(w), f64::from(h));
+    match pos {
+        Position::Left => (x + 0.5, y + h / 2.0),
+        Position::Right => (x + w - 0.5, y + h / 2.0),
+        Position::Top => (x + w / 2.0, y + 0.5),
+        Position::Bottom => (x + w / 2.0, y + h - 0.5),
+    }
+}
+
+/// Point a few pixels inside the output on the same side as the barrier.
+///
+/// Used to force the pointer to leave the barrier before re-entering it:
+/// when the pointer is already resting on the 1px strip (e.g. right after
+/// a release), warping directly onto the strip does not produce a new
+/// `wl_pointer.enter` event.
+fn approach_point(pos: Position, (x, y, w, h): Rect) -> (f64, f64) {
+    const INSET: f64 = 10.0;
+    let (x, y, w, h) = (f64::from(x), f64::from(y), f64::from(w), f64::from(h));
+    match pos {
+        Position::Left => (x + INSET, y + h / 2.0),
+        Position::Right => (x + w - INSET, y + h / 2.0),
+        Position::Top => (x + w / 2.0, y + INSET),
+        Position::Bottom => (x + w / 2.0, y + h - INSET),
+    }
+}
+
+/// Resolution used to express an absolute position as a fraction of the
+/// layout, as the protocol takes integers plus an extent. Higher values
+/// give sub-pixel precision.
+const ABSOLUTE_MOTION_RESOLUTION: u32 = 1_000_000;
+
+/// Convert a point in layout coordinates into the `(position, extent)`
+/// pair expected by `motion_absolute`.
+fn normalize_point(point: (f64, f64), layout: Rect) -> Option<(u32, u32)> {
+    let (x, y, w, h) = layout;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let nx = ((point.0 - f64::from(x)) / f64::from(w)).clamp(0.0, 1.0);
+    let ny = ((point.1 - f64::from(y)) / f64::from(h)).clamp(0.0, 1.0);
+    Some((
+        (nx * f64::from(ABSOLUTE_MOTION_RESOLUTION)).round() as u32,
+        (ny * f64::from(ABSOLUTE_MOTION_RESOLUTION)).round() as u32,
+    ))
+}
+
 impl LayerShellInputCapture {
     pub fn new() -> std::result::Result<Self, LayerShellCaptureCreationError> {
         let conn = Connection::connect_to_env()?;
@@ -310,6 +394,18 @@ impl LayerShellInputCapture {
         }
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
 
+        // Optional: lets frontends start a capture from a key binding or
+        // IPC request by warping the pointer onto the barrier. Without it,
+        // only physical edge crossings can start a capture.
+        let virtual_pointer_manager: Option<ZwlrVirtualPointerManagerV1> = global_list
+            .bind(&qh, 1..=2, ())
+            .map_err(|e| {
+                log::warn!(
+                    "wlr-virtual-pointer not supported, cannot activate capture via IPC: {e}"
+                )
+            })
+            .ok();
+
         let mut state = State {
             active_positions: Default::default(),
             pointer: None,
@@ -324,10 +420,12 @@ impl LayerShellInputCapture {
                 relative_pointer_manager,
                 shortcut_inhibit_manager,
                 xdg_output_manager,
+                virtual_pointer_manager,
             },
             pointer_lock: None,
             rel_pointer: None,
             shortcut_inhibitor: None,
+            virtual_pointer: None,
             active_windows: Vec::new(),
             focused: None,
             qh,
@@ -506,6 +604,55 @@ impl State {
         }
     }
 
+    /// Move the pointer onto the barrier at `pos` so the regular enter
+    /// handling starts a capture.
+    fn activate(&mut self, pos: Position) -> Result<(), CaptureError> {
+        let window = self
+            .active_windows
+            .iter()
+            .find(|w| w.pos == pos)
+            .cloned()
+            .ok_or(CaptureError::NoCaptureAtPosition(pos))?;
+        let layout = layout_box(&self.outputs).ok_or(CaptureError::NoCaptureAtPosition(pos))?;
+
+        let manager = self
+            .globals
+            .virtual_pointer_manager
+            .clone()
+            .ok_or(CaptureError::ActivateUnsupported)?;
+        if self.virtual_pointer.is_none() {
+            self.virtual_pointer = Some(manager.create_virtual_pointer(None, &self.qh, ()));
+        }
+        let pointer = self.virtual_pointer.as_ref().expect("virtual pointer");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+
+        // Move just inside the output first: if the pointer already rests
+        // on the 1px strip, warping straight to the strip is a no-op and
+        // the compositor does not send another `wl_pointer.enter`.
+        for point in [
+            approach_point(pos, window.output_rect),
+            barrier_point(pos, window.output_rect),
+        ] {
+            let (x, y) =
+                normalize_point(point, layout).ok_or(CaptureError::NoCaptureAtPosition(pos))?;
+            pointer.motion_absolute(
+                now,
+                x,
+                y,
+                ABSOLUTE_MOTION_RESOLUTION,
+                ABSOLUTE_MOTION_RESOLUTION,
+            );
+            pointer.frame();
+        }
+
+        log::info!("moving pointer to the {pos} barrier to activate capture");
+        Ok(())
+    }
+
     fn add_client(&mut self, pos: Position) {
         self.active_positions.insert(pos);
         let outputs = get_output_configuration(self, pos);
@@ -522,8 +669,8 @@ impl State {
                 .collect::<Vec<_>>()
         );
         outputs.iter().for_each(|o| {
-            if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
+            if o.info.is_some() {
+                let window = Window::new(self, &self.qh, o, pos);
                 let window = Arc::new(window);
                 self.active_windows.push(window);
             }
@@ -624,6 +771,12 @@ impl Capture for LayerShellInputCapture {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
         inner.state.ungrab();
+        Ok(inner.flush_events()?)
+    }
+
+    fn activate(&mut self, pos: Position) -> Result<(), CaptureError> {
+        let inner = self.0.get_mut();
+        inner.state.activate(pos)?;
         Ok(inner.flush_events()?)
     }
 
@@ -1011,6 +1164,8 @@ delegate_noop!(State: ZwlrLayerShellV1);
 delegate_noop!(State: ZwpRelativePointerManagerV1);
 delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
 delegate_noop!(State: ZwpPointerConstraintsV1);
+delegate_noop!(State: ZwlrVirtualPointerManagerV1);
+delegate_noop!(State: ZwlrVirtualPointerV1);
 
 // ignore events
 delegate_noop!(State: ignore ZxdgOutputManagerV1);
@@ -1019,3 +1174,71 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OUTPUT: Rect = (100, 50, 1920, 1080);
+
+    fn to_layout(p: (f64, f64), layout: Rect) -> (f64, f64) {
+        let (x, y, w, h) = layout;
+        (
+            x as f64 + p.0 / f64::from(ABSOLUTE_MOTION_RESOLUTION) * w as f64,
+            y as f64 + p.1 / f64::from(ABSOLUTE_MOTION_RESOLUTION) * h as f64,
+        )
+    }
+
+    #[test]
+    fn barrier_points_lie_on_the_outer_pixel() {
+        assert_eq!(barrier_point(Position::Left, OUTPUT), (100.5, 590.0));
+        assert_eq!(barrier_point(Position::Right, OUTPUT), (2019.5, 590.0));
+        assert_eq!(barrier_point(Position::Top, OUTPUT), (1060.0, 50.5));
+        assert_eq!(barrier_point(Position::Bottom, OUTPUT), (1060.0, 1129.5));
+    }
+
+    #[test]
+    fn approach_points_are_inside_the_output() {
+        assert_eq!(approach_point(Position::Left, OUTPUT), (110.0, 590.0));
+        assert_eq!(approach_point(Position::Right, OUTPUT), (2010.0, 590.0));
+        assert_eq!(approach_point(Position::Top, OUTPUT), (1060.0, 60.0));
+        assert_eq!(approach_point(Position::Bottom, OUTPUT), (1060.0, 1120.0));
+    }
+
+    #[test]
+    fn normalized_points_round_trip_to_the_same_coordinates() {
+        let layouts = [OUTPUT, (0, 0, 3840, 2160), (-100, -50, 3840, 2160)];
+        for layout in layouts {
+            for pos in [
+                Position::Left,
+                Position::Right,
+                Position::Top,
+                Position::Bottom,
+            ] {
+                let point = barrier_point(pos, OUTPUT);
+                let (nx, ny) = normalize_point(point, layout).expect("normalized point");
+                let (x, y) = to_layout((f64::from(nx), f64::from(ny)), layout);
+                assert!((x - point.0).abs() < 0.01, "{pos}: x {x} != {}", point.0);
+                assert!((y - point.1).abs() < 0.01, "{pos}: y {y} != {}", point.1);
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_points_are_clamped() {
+        let layout = (0, 0, 1920, 1080);
+        let (x, y) = normalize_point((-100.0, 5000.0), layout).expect("normalized point");
+        assert_eq!(x, 0);
+        assert_eq!(y, ABSOLUTE_MOTION_RESOLUTION);
+    }
+
+    #[test]
+    fn union_rects_covers_offset_outputs() {
+        assert_eq!(union_rects(std::iter::empty()), None);
+        assert_eq!(union_rects([OUTPUT].into_iter()), Some(OUTPUT));
+        assert_eq!(
+            union_rects([(0, 0, 1920, 1080), (1920, 200, 2560, 1440)].into_iter()),
+            Some((0, 0, 4480, 1640))
+        );
+    }
+}

@@ -66,6 +66,8 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// reenable input capture
     Reenable,
+    /// start capturing at a position without a pointer crossing
+    Activate(lan_mouse_ipc::Position),
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
 }
@@ -134,6 +136,13 @@ impl Capture {
     pub(crate) fn release(&self) {
         self.request_tx
             .send(CaptureRequest::Release)
+            .expect("channel closed");
+    }
+
+    /// enter the client at `pos` without moving the pointer there.
+    pub(crate) fn activate(&self, pos: lan_mouse_ipc::Position) {
+        self.request_tx
+            .send(CaptureRequest::Activate(pos))
             .expect("channel closed");
     }
 
@@ -218,6 +227,9 @@ impl CaptureTask {
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
+                        CaptureRequest::Activate(_) => {
+                            log::warn!("cannot activate capture: input capture is disabled");
+                        }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
@@ -303,6 +315,18 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Activate(pos) => {
+                        if self.active_client.is_some() {
+                            log::debug!("already capturing, ignoring activate request for {pos}");
+                        } else {
+                            log::info!("activating capture at {pos}");
+                            if let Err(e) = capture.activate(to_capture_pos(pos)).await {
+                                // a backend that cannot be activated must not
+                                // tear down the capture session
+                                log::warn!("could not activate capture at {pos}: {e}");
+                            }
+                        }
+                    }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;

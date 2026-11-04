@@ -254,6 +254,8 @@ pub enum FrontendRequest {
     EnableCapture,
     /// request reenabling input emulation
     EnableEmulation,
+    /// enter the client at the given position without moving the pointer there
+    Enter(Position),
     /// synchronize all state
     Sync,
     /// authorize fingerprint (description, fingerprint)
