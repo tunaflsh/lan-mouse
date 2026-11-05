@@ -311,6 +311,10 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            // The peer has torn down its own capture by
+                            // now, so the pointer is no longer locked to
+                            // the barrier.
+                            self.send_pending_inset(handle).await;
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -421,8 +425,6 @@ impl CaptureTask {
             },
         };
 
-        let is_enter = matches!(event, ProtoEvent::Enter(_));
-
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
@@ -431,23 +433,30 @@ impl CaptureTask {
             // active_client field would stay stale until the next
             // Begin from a different handle).
             self.release_capture(capture).await?;
-        } else if is_enter {
-            // IPC-triggered entries put the peer's pointer 540 px
-            // inside the screen instead of leaving it on the edge it
-            // entered from. The peer receives this before any real
-            // input, so its pointer starts inside.
-            if let Some((pos, at)) = self.pending_inset.take() {
-                if pos == self.get_pos(handle) && at.elapsed() < Duration::from_secs(2) {
-                    let (dx, dy) = ipc_enter_inset(pos);
-                    let motion =
-                        ProtoEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }));
-                    if let Err(e) = self.conn.send(motion, handle).await {
-                        log::warn!("failed to move client {handle} pointer inside: {e}");
-                    }
+        }
+        Ok(())
+    }
+
+    /// Move the peer's pointer into its screen after an IPC-triggered
+    /// entry is acknowledged.
+    ///
+    /// This must run after the `Ack`, not with the initial `Enter`: the
+    /// peer releases its own capture (and the pointer lock on the 1-px
+    /// barrier) in response to `Enter`, and a motion sent before that is
+    /// clamped to the barrier. Waiting for the acknowledgement gives the
+    /// peer time to tear its capture down, so the pointer ends up inside
+    /// the screen instead of on the edge.
+    async fn send_pending_inset(&mut self, handle: CaptureHandle) {
+        if let Some((pos, at)) = self.pending_inset.take() {
+            if pos == self.get_pos(handle) && at.elapsed() < Duration::from_secs(2) {
+                let (dx, dy) = ipc_enter_inset(pos);
+                let motion =
+                    ProtoEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }));
+                if let Err(e) = self.conn.send(motion, handle).await {
+                    log::warn!("failed to move client {handle} pointer inside: {e}");
                 }
             }
         }
-        Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
