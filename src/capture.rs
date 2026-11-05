@@ -8,7 +8,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -91,6 +91,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            pending_inset: None,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -182,6 +183,13 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// position and time of the latest IPC-triggered activation.
+    ///
+    /// The peer's pointer normally rests on the edge that faces this
+    /// device (where the previous return left it), so once the entry is
+    /// acknowledged it is moved into the screen by [`IPC_ENTER_INSET`].
+    /// Entries caused by crossing a screen edge never set this.
+    pending_inset: Option<(Position, Instant)>,
 }
 
 impl CaptureTask {
@@ -320,10 +328,17 @@ impl CaptureTask {
                             log::debug!("already capturing, ignoring activate request for {pos}");
                         } else {
                             log::info!("activating capture at {pos}");
-                            if let Err(e) = capture.activate(to_capture_pos(pos)).await {
-                                // a backend that cannot be activated must not
-                                // tear down the capture session
-                                log::warn!("could not activate capture at {pos}: {e}");
+                            match capture.activate(to_capture_pos(pos)).await {
+                                Ok(()) => {
+                                    self.pending_inset =
+                                        Some((to_capture_pos(pos), Instant::now()));
+                                }
+                                Err(e) => {
+                                    // a backend that cannot be activated must not
+                                    // tear down the capture session
+                                    log::warn!("could not activate capture at {pos}: {e}");
+                                    self.pending_inset = None;
+                                }
                             }
                         }
                     }
@@ -406,6 +421,8 @@ impl CaptureTask {
             },
         };
 
+        let is_enter = matches!(event, ProtoEvent::Enter(_));
+
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
@@ -414,11 +431,27 @@ impl CaptureTask {
             // active_client field would stay stale until the next
             // Begin from a different handle).
             self.release_capture(capture).await?;
+        } else if is_enter {
+            // IPC-triggered entries put the peer's pointer 540 px
+            // inside the screen instead of leaving it on the edge it
+            // entered from. The peer receives this before any real
+            // input, so its pointer starts inside.
+            if let Some((pos, at)) = self.pending_inset.take() {
+                if pos == self.get_pos(handle) && at.elapsed() < Duration::from_secs(2) {
+                    let (dx, dy) = ipc_enter_inset(pos);
+                    let motion =
+                        ProtoEvent::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx, dy }));
+                    if let Err(e) = self.conn.send(motion, handle).await {
+                        log::warn!("failed to move client {handle} pointer inside: {e}");
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        self.pending_inset = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
@@ -501,6 +534,27 @@ fn to_proto_pos(pos: input_capture::Position) -> lan_mouse_proto::Position {
     }
 }
 
+/// Distance, in the peer's logical screen coordinates, that an
+/// IPC-triggered entry moves the peer's pointer into its screen.
+const IPC_ENTER_INSET: f64 = 540.0;
+
+/// Relative motion that moves the peer's pointer away from the edge it
+/// entered from.
+///
+/// `pos` is the position of the client on this screen, i.e. the side the
+/// pointer crossed towards. The peer is entered through the opposite
+/// edge, so the inward direction is the direction of `pos` itself: a
+/// client on the left is entered from the peer's right edge and the
+/// pointer moves left.
+fn ipc_enter_inset(pos: input_capture::Position) -> (f64, f64) {
+    match pos {
+        input_capture::Position::Left => (-IPC_ENTER_INSET, 0.0),
+        input_capture::Position::Right => (IPC_ENTER_INSET, 0.0),
+        input_capture::Position::Top => (0.0, -IPC_ENTER_INSET),
+        input_capture::Position::Bottom => (0.0, IPC_ENTER_INSET),
+    }
+}
+
 struct DropGuard<T> {
     tx: Sender<T>,
     on_drop: Option<T>,
@@ -519,5 +573,29 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipc_inset_moves_inward_from_the_entry_edge() {
+        // A client to the left is entered through the peer's right edge,
+        // so the pointer has to move left to go inside.
+        assert_eq!(
+            ipc_enter_inset(input_capture::Position::Left),
+            (-540.0, 0.0)
+        );
+        assert_eq!(
+            ipc_enter_inset(input_capture::Position::Right),
+            (540.0, 0.0)
+        );
+        assert_eq!(ipc_enter_inset(input_capture::Position::Top), (0.0, -540.0));
+        assert_eq!(
+            ipc_enter_inset(input_capture::Position::Bottom),
+            (0.0, 540.0)
+        );
     }
 }

@@ -363,6 +363,12 @@ lan-mouse cli right
 like the `position` option in the configuration file. The release bind still
 returns control to the local machine.
 
+Entries started this way also move the peer's pointer 540 px (in the peer's
+logical coordinates) into its screen once the connection is acknowledged. The
+peer's pointer normally rests on the edge facing this machine after a return, so
+this places it inside the screen instead of on the edge; entries caused by
+crossing an edge are unaffected.
+
 This is useful for keyboard-driven setups and for compositors where reaching the
 screen edge is impractical. For example in niri:
 
